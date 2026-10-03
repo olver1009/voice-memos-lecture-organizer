@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""Build a read-only Voice Memos -> Notes action plan.
-
-The caller supplies the current Voice Memos "모든 녹음 항목" AX rows. The
-script intersects those rows with the databases, applies the fixed timetable,
-and returns only the UI mutations and reports that are still needed.
-"""
+"""Read-only lecture title/folder planner; all mutations belong to Voice Memos UI."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
+import tempfile
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta, timezone
@@ -27,21 +25,13 @@ START_DATE = date(2026, 9, 1)
 END_DATE = date(2026, 12, 18)
 
 VOICE_DB = Path.home() / "Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/CloudRecordings.db"
-NOTES_DB = Path.home() / "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
+CACHE = Path.home() / "Documents/Codex/.cache/lecture-recording-organizer.json"
 
 SCHEDULE = {
     0: [("09:00", "10:30", "미주지역지리"), ("13:00", "15:00", "지도학및실습"), ("16:30", "18:00", "도시지리학특강")],
     1: [("15:00", "16:30", "응용 지형학"), ("16:30", "18:00", "기후변화와 미래환경")],
     2: [("10:30", "12:00", "미주지역지리"), ("13:00", "15:00", "지도학및실습"), ("15:00", "16:30", "도시지리학특강")],
     3: [("15:00", "16:30", "응용 지형학"), ("16:30", "18:00", "기후변화와 미래환경")],
-}
-
-NOTE_FOLDERS = {
-    "미주지역지리": "미주지역지리",
-    "지도학및실습": "지도학",
-    "도시지리학특강": "도시지리특강",
-    "응용 지형학": "응용지형학",
-    "기후변화와 미래환경": "기후변화",
 }
 
 
@@ -115,12 +105,16 @@ def load_voice_rows(path: Path, today: date) -> tuple[list[dict], set[tuple[str,
     with ro_connect(path) as db:
         rows = db.execute(
             """
-            SELECT Z_PK, ZUNIQUEID, ZCUSTOMLABELFORSORTING, ZPATH, ZDATE, ZDURATION
+            SELECT Z_PK, ZUNIQUEID, ZCUSTOMLABELFORSORTING, ZPATH, ZDATE, ZDURATION, ZFOLDER
             FROM ZCLOUDRECORDING
             WHERE ZPATH IS NOT NULL
             ORDER BY ZDATE
             """
         ).fetchall()
+    return voice_candidates(rows, today)
+
+
+def voice_candidates(rows: list, today: date) -> tuple[list[dict], set[tuple[str, int]]]:
     result = []
     ignored: set[tuple[str, int]] = set()
     upper = min(today, END_DATE)
@@ -141,11 +135,10 @@ def load_voice_rows(path: Path, today: date) -> tuple[list[dict], set[tuple[str,
         result.append(
             {
                 "z_pk": int(row["Z_PK"]),
+                "folder_pk": row["ZFOLDER"],
                 "unique_id": row["ZUNIQUEID"],
                 "current_title": title,
-                "path": row["ZPATH"],
                 "started": started,
-                "duration": float(row["ZDURATION"]),
                 "seconds": seconds,
                 "course": classify(started),
             }
@@ -153,71 +146,24 @@ def load_voice_rows(path: Path, today: date) -> tuple[list[dict], set[tuple[str,
     return result, ignored
 
 
-def entity_ids(db: sqlite3.Connection) -> dict[str, int]:
-    return {row["Z_NAME"]: int(row["Z_ENT"]) for row in db.execute("SELECT Z_ENT, Z_NAME FROM Z_PRIMARYKEY")}
-
-
-def load_notes(path: Path) -> tuple[dict[tuple[str, str], list[int]], dict[int, list[dict]]]:
+def load_folders(path: Path) -> dict[str, list[int]]:
+    folders = defaultdict(list)
     with ro_connect(path) as db:
-        entities = entity_ids(db)
-        required = {"ICAttachment", "ICNote", "ICFolder"}
-        if not required.issubset(entities):
-            raise RuntimeError(f"Notes schema missing entities: {sorted(required - entities.keys())}")
-        folders = {
-            int(row["Z_PK"]): normalized_title(row["ZTITLE2"])
-            for row in db.execute(
-                "SELECT Z_PK, ZTITLE2 FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT=? AND COALESCE(ZMARKEDFORDELETION,0)=0",
-                (entities["ICFolder"],),
-            )
-        }
-        notes: dict[tuple[str, str], list[int]] = defaultdict(list)
-        for row in db.execute(
-            "SELECT Z_PK, ZTITLE1, ZFOLDER FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT=? AND COALESCE(ZMARKEDFORDELETION,0)=0",
-            (entities["ICNote"],),
-        ):
-            folder = folders.get(row["ZFOLDER"])
-            if folder:
-                notes[(folder, normalized_title(row["ZTITLE1"]))].append(int(row["Z_PK"]))
-        attachments: dict[int, list[dict]] = defaultdict(list)
-        for row in db.execute(
-            """
-            SELECT Z_PK, ZNOTE, ZTITLE, ZDURATION
-            FROM ZICCLOUDSYNCINGOBJECT
-            WHERE Z_ENT=?
-              AND ZTYPEUTI='com.apple.m4a-audio'
-              AND ZPARENTATTACHMENT IS NULL
-              AND ZPARENTATTACHMENT1 IS NULL
-              AND COALESCE(ZMARKEDFORDELETION,0)=0
-            """,
-            (entities["ICAttachment"],),
-        ):
-            if row["ZNOTE"] is None:
-                continue
-            attachments[int(row["ZNOTE"])].append(
-                {
-                    "pk": int(row["Z_PK"]),
-                    "title": row["ZTITLE"] or "",
-                    "normalized_title": normalized_title(row["ZTITLE"]),
-                    "seconds": rounded_seconds(row["ZDURATION"] or 0),
-                }
-            )
-    return dict(notes), dict(attachments)
+        for row in db.execute("SELECT Z_PK, ZENCRYPTEDNAME FROM ZFOLDER"):
+            folders[normalized_title(row["ZENCRYPTEDNAME"])].append(int(row["Z_PK"]))
+    return dict(folders)
 
 
 def load_visible(raw: str) -> tuple[int, list[dict]]:
     payload = json.load(sys.stdin) if raw == "-" else json.loads(raw)
-    if isinstance(payload, list):
-        rows, total = payload, len(payload)
-    else:
-        rows = payload.get("rows", [])
-        total = int(payload.get("total_count", len(rows)))
+    rows = payload["rows"]
+    total = int(payload["total_count"])
     visible = []
-    for index, row in enumerate(rows):
+    for row in rows:
         title = row.get("title") or row.get("description") or ""
         duration = row.get("duration_seconds", row.get("duration"))
         visible.append(
             {
-                "index": index,
                 "title": title,
                 "normalized_title": normalized_title(title),
                 "seconds": parse_duration(duration),
@@ -232,13 +178,19 @@ def base_title(row: dict) -> str:
 
 
 def existing_title_slot(current: str, base: str, count: int) -> int | None:
+    # Keep correctly named legacy recordings (M/D, course whitespace, i/n).
     current_norm, base_norm = normalized_title(current), normalized_title(base)
+    current_norm = re.sub(r"^(\d+)/(\d+) ", r"\1월 \2일 ", current_norm)
+    current_norm = re.sub(r" (\d+)/(\d+)$", r" \1-\2", current_norm)
+    current_norm, base_norm = current_norm.replace(" ", ""), base_norm.replace(" ", "")
     if current_norm == base_norm:
         return 1
-    match = re.fullmatch(re.escape(base_norm) + r" (\d+)-(\d+)", current_norm)
+    match = re.fullmatch(re.escape(base_norm) + r"(\d+)-(\d+)", current_norm)
     if not match:
         return None
     position, total = map(int, match.groups())
+    if count == 1 and 1 <= position <= total:
+        return 1  # Do not renumber an already named historical fragment.
     return position if total == count and 1 <= position <= count else None
 
 
@@ -270,25 +222,27 @@ def assign_titles(group: list[dict]) -> None:
 def serialize_row(row: dict) -> dict:
     return {
         "z_pk": row["z_pk"],
+        "unique_id": row["unique_id"],
         "started_local": row["started"].isoformat(timespec="seconds"),
         "course": row["course"],
+        "folder_pk": row["folder_pk"],
         "current_title": row["current_title"],
         "desired_title": row.get("desired_title"),
         "duration_seconds": row["seconds"],
     }
 
 
-def build_plan(voice_db: Path, notes_db: Path, today: date, visible_raw: str) -> dict:
+def build_plan(voice_db: Path, today: date, visible_raw: str) -> dict:
+    if visible_raw == "-":
+        visible_raw = sys.stdin.read()
     total_count, visible = load_visible(visible_raw)
     if total_count != len(visible):
         return {"status": "fatal", "reason": "incomplete_all_recordings_ax", "expected_rows": total_count, "received_rows": len(visible), "actions": []}
 
     voice_rows, ignored_keys = load_voice_rows(voice_db, today)
     voice_by_key: dict[tuple[str, int], list[dict]] = defaultdict(list)
-    voice_by_seconds: dict[int, list[dict]] = defaultdict(list)
     for row in voice_rows:
         voice_by_key[(normalized_title(row["current_title"]), row["seconds"])].append(row)
-        voice_by_seconds[row["seconds"]].append(row)
     visible_counts = Counter((row["normalized_title"], row["seconds"]) for row in visible)
 
     verified, reports = [], []
@@ -299,12 +253,9 @@ def build_plan(voice_db: Path, notes_db: Path, today: date, visible_raw: str) ->
         matches = voice_by_key.get(key, [])
         if len(matches) == 1 and visible_counts[key] == 1:
             row = dict(matches[0])
-            row["visible_title"] = item["title"]
             verified.append(row)
             continue
-        duration_matches = voice_by_seconds.get(item["seconds"], [])
-        if duration_matches:
-            reports.append({"type": "list_unverified", "title": item["title"], "duration_seconds": item["seconds"]})
+        reports.append({"type": "list_unverified", "title": item["title"], "duration_seconds": item["seconds"]})
 
     if reports:
         return {"status": "fatal", "reason": "voice_memos_identity_mismatch", "actions": [], "reports": reports}
@@ -323,79 +274,132 @@ def build_plan(voice_db: Path, notes_db: Path, today: date, visible_raw: str) ->
         group.sort(key=lambda row: row["started"])
         assign_titles(group)
 
-    notes, attachments = load_notes(notes_db)
-    actions, completed = [], []
-    for (lecture_date, course), group in sorted(grouped.items()):
-        note_folder = normalized_title(NOTE_FOLDERS[course])
-        note_date = f"{lecture_date.month}/{lecture_date.day}"
-        note_ids = notes.get((note_folder, normalized_title(note_date)), [])
-        if len(note_ids) != 1:
-            issue = "note_missing" if not note_ids else "note_duplicate"
-            reports.append({"type": issue, "course": course, "date": note_date, "count": len(note_ids)})
-            for row in group:
-                rename_to = row["desired_title"] if normalized_title(row["current_title"]) != normalized_title(row["desired_title"]) else None
-                if rename_to:
-                    actions.append({"type": "rename", "rename_to": rename_to, **serialize_row(row)})
+    folders = load_folders(voice_db)
+    payload = json.loads(visible_raw)
+    visible_folders = Counter(normalized_title(name) for name in payload["folders"])
+    actions, completed = [], 0
+    for row in sorted(timetable_rows, key=lambda item: item["started"]):
+        course = row["course"]
+        ids = folders.get(course, [])
+        if len(ids) != 1 or visible_folders[course] != 1:
+            reports.append({"type": "folder_missing_or_duplicate", "course": course})
             continue
-
-        note_pk = note_ids[0]
-        note_attachments = attachments.get(note_pk, [])
-        expected_pairs = {(normalized_title(row["desired_title"]), row["seconds"]) for row in group}
-        extras = [item for item in note_attachments if (item["normalized_title"], item["seconds"]) not in expected_pairs]
-        duplicate_pairs = [pair for pair, count in Counter((item["normalized_title"], item["seconds"]) for item in note_attachments).items() if count > 1]
-        note_has_issue = bool(extras or duplicate_pairs)
-        if note_has_issue:
-            reports.append(
-                {
-                    "type": "existing_attachment_issue",
-                    "course": course,
-                    "date": note_date,
-                    "note_pk": note_pk,
-                    "extras": [{"pk": item["pk"], "title": item["title"], "duration_seconds": item["seconds"]} for item in extras],
-                    "duplicates": [{"title": title, "duration_seconds": seconds} for title, seconds in duplicate_pairs],
-                }
-            )
-
-        for row in group:
-            rename_to = row["desired_title"] if normalized_title(row["current_title"]) != normalized_title(row["desired_title"]) else None
-            matching = [item for item in note_attachments if item["normalized_title"] == normalized_title(row["desired_title"]) and item["seconds"] == row["seconds"]]
-            if rename_to:
-                actions.append({"type": "rename", "rename_to": rename_to, **serialize_row(row)})
-            if note_has_issue:
-                continue
-            if len(matching) == 1:
-                completed.append(serialize_row(row))
-            elif not matching:
-                actions.append({"type": "attach", "note_pk": note_pk, "note_folder": NOTE_FOLDERS[course], "note_date": note_date, **serialize_row(row)})
-            else:
-                reports.append({"type": "existing_attachment_issue", "course": course, "date": note_date, "note_pk": note_pk})
+        rename = normalized_title(row["current_title"]) != normalized_title(row["desired_title"])
+        move = row["folder_pk"] != ids[0]
+        if rename or move:
+            actions.append({
+                **serialize_row(row),
+                "rename_to": row["desired_title"] if rename else None,
+                "move_to": course if move else None,
+                "desired_folder_pk": ids[0],
+            })
+        else:
+            completed += 1
 
     return {
         "status": "ok",
         "all_recordings_count": total_count,
         "verified_candidates": len(verified),
         "actions": actions,
-        "completed": completed,
         "reports": reports,
         "summary": {
-            "rename": sum(action["type"] == "rename" for action in actions),
-            "attach": sum(action["type"] == "attach" for action in actions),
-            "completed": len(completed),
+            "rename": sum(bool(action["rename_to"]) for action in actions),
+            "move": sum(bool(action["move_to"]) for action in actions),
+            "completed": completed,
             "reports": len(reports),
         },
     }
 
 
+def verify(voice_db: Path, raw: str) -> dict:
+    """Check the same recording identities after UI edits."""
+    expected = json.loads(sys.stdin.read() if raw == "-" else raw)
+    failures = []
+    with ro_connect(voice_db) as db:
+        for item in expected:
+            row = db.execute(
+                "SELECT ZCUSTOMLABELFORSORTING, ZFOLDER, ZDURATION, ZUNIQUEID FROM ZCLOUDRECORDING WHERE Z_PK=?",
+                (item["z_pk"],),
+            ).fetchone()
+            if (row is None
+                or row["ZUNIQUEID"] != item["unique_id"]
+                or normalized_title(row["ZCUSTOMLABELFORSORTING"]) != normalized_title(item["title"])
+                or row["ZFOLDER"] != item["folder_pk"]
+                or rounded_seconds(row["ZDURATION"] or 0) != item["duration_seconds"]):
+                failures.append(item["z_pk"])
+    return {"status": "ok" if not failures else "failed", "checked": len(expected), "failed_ids": failures}
+
+
+def fingerprint(voice_db: Path, today: date) -> str:
+    # Include every persisted recording/folder field, including deletion flags.
+    # Do not interpret undocumented flags or store private row contents in the cache.
+    with ro_connect(voice_db) as db:
+        db.execute("BEGIN")
+        state = {
+            table: [dict(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY Z_PK")]
+            for table in ("ZCLOUDRECORDING", "ZFOLDER")
+        }
+    eligible, _ = voice_candidates(state["ZCLOUDRECORDING"], today)
+    state["eligible_ids"] = [row["z_pk"] for row in eligible]
+    state["database"] = str(voice_db.resolve())
+    state["policy"] = [START_DATE.isoformat(), END_DATE.isoformat(), SCHEDULE]
+    state["code"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    encoded = json.dumps(state, ensure_ascii=False, default=lambda value: value.hex()).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def check_cache(voice_db: Path, today: date, cache: Path) -> dict:
+    try:
+        saved = json.loads(cache.read_text())
+    except (OSError, ValueError):
+        return {"status": "needs_ui", "reason": "no_verified_snapshot"}
+    if not isinstance(saved, dict):
+        return {"status": "needs_ui", "reason": "invalid_verified_snapshot"}
+    if saved.get("fingerprint") != fingerprint(voice_db, today):
+        return {"status": "needs_ui", "reason": "recordings_folders_or_rules_changed"}
+    return {"status": "no_changes", "basis": "unchanged_ui_verified_snapshot", "actions": []}
+
+
+def remember(voice_db: Path, today: date, raw: str, cache: Path) -> dict:
+    if raw == "-":
+        raw = sys.stdin.read()
+    before = fingerprint(voice_db, today)
+    result = build_plan(voice_db, today, raw)
+    if result["status"] != "ok" or result["actions"] or result["reports"]:
+        return {"status": "not_saved", "reason": "not_fully_verified_complete"}
+    if fingerprint(voice_db, today) != before:
+        return {"status": "not_saved", "reason": "database_changed_during_verification"}
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic replacement: interruption cannot leave a partial success record.
+    with tempfile.NamedTemporaryFile(mode="w", dir=cache.parent, delete=False) as handle:
+        json.dump({"fingerprint": before}, handle)
+        temp_path = handle.name
+    os.replace(temp_path, cache)
+    return {"status": "ok", "verified_candidates": result["verified_candidates"]}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--visible-json", required=True, help="JSON array/object from Voice Memos 모든 녹음 항목 AX; use - for stdin")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--visible-json", help="Complete UI rows, total_count and folder names; - for stdin")
+    mode.add_argument("--verify-json", help="Expected z_pk, unique_id, title, folder_pk, duration_seconds; - for stdin")
+    mode.add_argument("--check", action="store_true", help="Skip UI only when the last fully verified DB snapshot is unchanged")
+    mode.add_argument("--remember-json", help="Fresh complete UI inventory after all work; save only if no actions/reports remain")
     parser.add_argument("--voice-db", type=Path, default=VOICE_DB)
-    parser.add_argument("--notes-db", type=Path, default=NOTES_DB)
+    parser.add_argument("--cache", type=Path, default=CACHE)
     parser.add_argument("--today", type=date.fromisoformat, default=datetime.now(SEOUL).date())
     args = parser.parse_args()
     try:
-        emit(build_plan(args.voice_db, args.notes_db, args.today, args.visible_json))
-    except (FileNotFoundError, ValueError, sqlite3.Error, RuntimeError, json.JSONDecodeError) as error:
+        if args.check:
+            result = check_cache(args.voice_db, args.today, args.cache)
+        elif args.remember_json is not None:
+            result = remember(args.voice_db, args.today, args.remember_json, args.cache)
+        elif args.verify_json is not None:
+            result = verify(args.voice_db, args.verify_json)
+        else:
+            result = build_plan(args.voice_db, args.today, args.visible_json)
+        emit(result, 0 if result["status"] in ("ok", "no_changes", "needs_ui") else 2)
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, RuntimeError, json.JSONDecodeError) as error:
         emit({"status": "fatal", "reason": type(error).__name__, "detail": str(error), "actions": []}, 2)
 
 
