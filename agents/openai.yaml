@@ -1,7 +1,6 @@
 interface:
-  display_name: "녹음-메모 자동화"
-  short_description: "누락된 강의 녹음 이름 변경 및 메모 첨부"
-  default_prompt: "Use $lecture-recording-organizer to reconcile missing lecture recording names and Apple Notes attachments without transcription checks."
-
+  display_name: "음성 메모 강의 정리"
+  short_description: "강의 녹음 이름을 맞추고 음성 메모의 과목별 폴더로 정리"
+  default_prompt: "Use $lecture-recording-organizer to rename lecture recordings and sort them into matching course folders inside Apple Voice Memos."
 policy:
   allow_implicit_invocation: true
