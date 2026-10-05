@@ -57,6 +57,12 @@ def normalized_title(value: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def canonical_title(value: str) -> str:
+    text = normalized_title(value)
+    text = re.sub(r"^(\d+)/(\d+) ", r"\1월 \2일 ", text)
+    return re.sub(r" (\d+)/(\d+)$", r" \1-\2", text)
+
+
 def rounded_seconds(value: float | int) -> int:
     return int(float(value) + 0.5)
 
@@ -178,10 +184,8 @@ def base_title(row: dict) -> str:
 
 
 def existing_title_slot(current: str, base: str, count: int) -> int | None:
-    # Keep correctly named legacy recordings (M/D, course whitespace, i/n).
-    current_norm, base_norm = normalized_title(current), normalized_title(base)
-    current_norm = re.sub(r"^(\d+)/(\d+) ", r"\1월 \2일 ", current_norm)
-    current_norm = re.sub(r" (\d+)/(\d+)$", r" \1-\2", current_norm)
+    # Normalize legacy date/part separators for slot matching; assignment writes canonical_title.
+    current_norm, base_norm = canonical_title(current), normalized_title(base)
     current_norm, base_norm = current_norm.replace(" ", ""), base_norm.replace(" ", "")
     if current_norm == base_norm:
         return 1
@@ -201,7 +205,7 @@ def assign_titles(group: list[dict]) -> None:
         base = base_title(row)
         slot = existing_title_slot(row["current_title"], base, count)
         if slot is not None and slot not in used:
-            row["desired_title"] = normalized_title(row["current_title"])
+            row["desired_title"] = canonical_title(row["current_title"])
             used.add(slot)
         else:
             row["desired_title"] = None
