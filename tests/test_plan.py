@@ -55,7 +55,6 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(action["desired_folder_pk"], 4)
 
     def test_legacy_separators_are_normalized_and_standard_names_are_noops(self):
-        
         cases = [
             ("9/22 응용지형학", "9월 22일 응용지형학"),
             ("9월 22일 응용 지형학", None),
@@ -119,7 +118,52 @@ class PlannerTests(unittest.TestCase):
         self.add(duration=600)
         self.add("evening", started="2026-09-22T18:00:00+09:00")
         self.add("old", started="2026-08-31T09:00:00+09:00")
-        self.assertEqual(self.run_plan()["actions"], [])
+        result = self.run_plan()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(result["reports"], [])
+
+    def test_excluded_and_eligible_identity_collisions_stop_edits_and_cache(self):
+        cases = [
+            ("2026-08-31T09:00:00+09:00", 4000, 4000),
+            ("2026-09-22T18:00:00+09:00", 4000, 4000),
+            ("2026-09-22T15:00:00+09:00", 600, 600.4),
+        ]
+        cache = Path(self.tmp.name) / "state.json"
+        for started, excluded_duration, eligible_duration in cases:
+            for excluded_visible in (False, True):
+                with self.subTest(started=started, excluded_visible=excluded_visible):
+                    self.db.execute("DELETE FROM ZCLOUDRECORDING")
+                    self.rows.clear()
+                    self.add(started=started, duration=excluded_duration,
+                             visible=excluded_visible)
+                    self.add(duration=eligible_duration)
+                    result = self.run_plan()
+                    self.assertEqual(result["status"], "fatal")
+                    self.assertEqual(result["reason"], "voice_memos_identity_mismatch")
+                    self.assertEqual(result["actions"], [])
+                    payload = json.dumps({"total_count": len(self.rows),
+                                          "folders": self.folders, "rows": self.rows})
+                    self.assertEqual(plan.remember(self.path, date(2026, 10, 3),
+                                                  payload, cache)["status"], "not_saved")
+                    self.assertFalse(cache.exists())
+                    self.assertEqual(plan.check_cache(self.path, date(2026, 10, 3),
+                                                     cache)["status"], "needs_ui")
+
+    def test_duplicate_excluded_identities_stop_edits_and_cache(self):
+        cache = Path(self.tmp.name) / "state.json"
+        for first_visible in (False, True):
+            with self.subTest(first_visible=first_visible):
+                self.db.execute("DELETE FROM ZCLOUDRECORDING")
+                self.rows.clear()
+                self.add(duration=600, visible=first_visible)
+                self.add(duration=600)
+                self.assertEqual(self.run_plan()["status"], "fatal")
+                payload = json.dumps({"total_count": len(self.rows),
+                                      "folders": self.folders, "rows": self.rows})
+                self.assertEqual(plan.remember(self.path, date(2026, 10, 3),
+                                              payload, cache)["status"], "not_saved")
+                self.assertFalse(cache.exists())
 
     def test_timetable_and_early_boundary(self):
         for clock, expected in [("12:44", None), ("12:45", "지도학및실습"),
@@ -135,6 +179,31 @@ class PlannerTests(unittest.TestCase):
         actions = self.run_plan()["actions"]
         self.assertEqual([a["desired_title"] for a in actions],
                          ["9월 22일 응용 지형학 1-2", "9월 22일 응용 지형학 2-2"])
+
+    def test_three_initial_fragments_receive_stable_three_part_titles(self):
+        self.add("first")
+        self.add("second", started="2026-09-22T15:20:00+09:00", duration=2000)
+        self.add("third", started="2026-09-22T15:40:00+09:00", duration=1000)
+        actions = self.run_plan()["actions"]
+        self.assertEqual([a["desired_title"] for a in actions],
+                         [f"9월 22일 응용 지형학 {n}-3" for n in (1, 2, 3)])
+        for action, visible_row in zip(actions, self.rows):
+            self.db.execute("UPDATE ZCLOUDRECORDING SET ZCUSTOMLABELFORSORTING=?,ZFOLDER=? WHERE Z_PK=?",
+                            (action["desired_title"], action["desired_folder_pk"], action["z_pk"]))
+            visible_row["title"] = action["desired_title"]
+        self.db.commit()
+        self.assertEqual(self.run_plan()["actions"], [])
+
+    def test_cache_remembers_an_initially_completed_inventory(self):
+        self.add("9월 22일 응용 지형학", folder=4)
+        cache = Path(self.tmp.name) / "state.json"
+        result = self.run_plan()
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(result["reports"], [])
+        payload = json.dumps({"total_count": len(self.rows),
+                              "folders": self.folders, "rows": self.rows})
+        self.assertEqual(plan.remember(self.path, date(2026, 10, 3), payload, cache)["status"], "ok")
+        self.assertEqual(plan.check_cache(self.path, date(2026, 10, 3), cache)["status"], "no_changes")
 
     def test_verification_detects_partial_failure_or_changed_identity(self):
         pk = self.add(folder=4)

@@ -107,7 +107,7 @@ def classify(started: datetime) -> str | None:
     return early[0] if len(early) == 1 else None
 
 
-def load_voice_rows(path: Path, today: date) -> tuple[list[dict], set[tuple[str, int]]]:
+def load_voice_rows(path: Path, today: date) -> tuple[list[dict], Counter[tuple[str, int]]]:
     with ro_connect(path) as db:
         rows = db.execute(
             """
@@ -120,23 +120,23 @@ def load_voice_rows(path: Path, today: date) -> tuple[list[dict], set[tuple[str,
     return voice_candidates(rows, today)
 
 
-def voice_candidates(rows: list, today: date) -> tuple[list[dict], set[tuple[str, int]]]:
+def voice_candidates(rows: list, today: date) -> tuple[list[dict], Counter[tuple[str, int]]]:
     result = []
-    ignored: set[tuple[str, int]] = set()
+    ignored: Counter[tuple[str, int]] = Counter()
     upper = min(today, END_DATE)
     for row in rows:
         title = row["ZCUSTOMLABELFORSORTING"] or ""
         seconds = rounded_seconds(row["ZDURATION"] or 0)
         key = (normalized_title(title), seconds)
         if float(row["ZDURATION"] or 0) <= 600:
-            ignored.add(key)
+            ignored[key] += 1
             continue
         started = datetime.fromtimestamp(float(row["ZDATE"]) + APPLE_UNIX_OFFSET, timezone.utc).astimezone(SEOUL)
         if not (START_DATE <= started.date() <= upper):
-            ignored.add(key)
+            ignored[key] += 1
             continue
         if not (time(9, 0) <= started.time().replace(tzinfo=None) < time(18, 0)):
-            ignored.add(key)
+            ignored[key] += 1
             continue
         result.append(
             {
@@ -243,7 +243,7 @@ def build_plan(voice_db: Path, today: date, visible_raw: str) -> dict:
     if total_count != len(visible):
         return {"status": "fatal", "reason": "incomplete_all_recordings_ax", "expected_rows": total_count, "received_rows": len(visible), "actions": []}
 
-    voice_rows, ignored_keys = load_voice_rows(voice_db, today)
+    voice_rows, ignored_counts = load_voice_rows(voice_db, today)
     voice_by_key: dict[tuple[str, int], list[dict]] = defaultdict(list)
     for row in voice_rows:
         voice_by_key[(normalized_title(row["current_title"]), row["seconds"])].append(row)
@@ -252,10 +252,12 @@ def build_plan(voice_db: Path, today: date, visible_raw: str) -> dict:
     verified, reports = [], []
     for item in visible:
         key = (item["normalized_title"], item["seconds"])
-        if key in ignored_keys:
-            continue
         matches = voice_by_key.get(key, [])
-        if len(matches) == 1 and visible_counts[key] == 1:
+        # Skip only a uniquely identified excluded row. Mixed or duplicate
+        # identities must stop edits and prevent a false completion cache.
+        if not matches and ignored_counts[key] == 1 and visible_counts[key] == 1:
+            continue
+        if len(matches) == 1 and ignored_counts[key] == 0 and visible_counts[key] == 1:
             row = dict(matches[0])
             verified.append(row)
             continue
