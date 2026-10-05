@@ -54,13 +54,25 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(action["move_to"], "응용 지형학")
         self.assertEqual(action["desired_folder_pk"], 4)
 
-    def test_completed_and_legacy_names_are_noops(self):
-        for title in ["9/22 응용지형학", "9월 22일 응용 지형학", "9/22 응용 지형학 2/2"]:
+    def test_legacy_separators_are_normalized_and_standard_names_are_noops(self):
+        
+        cases = [
+            ("9/22 응용지형학", "9월 22일 응용지형학"),
+            ("9월 22일 응용 지형학", None),
+            ("9/22 응용 지형학 2/2", "9월 22일 응용 지형학 2-2"),
+            ("9월 22일 응용 지형학 1/2", "9월 22일 응용 지형학 1-2"),
+        ]
+        for title, expected in cases:
             with self.subTest(title=title):
                 self.db.execute("DELETE FROM ZCLOUDRECORDING")
                 self.rows.clear()
                 self.add(unicodedata.normalize("NFD", title), folder=4)
-                self.assertEqual(self.run_plan()["actions"], [])
+                actions = self.run_plan()["actions"]
+                if expected is None:
+                    self.assertEqual(actions, [])
+                else:
+                    self.assertEqual(len(actions), 1)
+                    self.assertEqual(actions[0]["rename_to"], expected)
 
     def test_move_only_and_rename_only(self):
         self.add("9월 22일 응용 지형학", folder=1)
