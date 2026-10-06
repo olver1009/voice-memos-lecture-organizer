@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
 import unicodedata
+from unittest.mock import patch
 from datetime import date, datetime
 from pathlib import Path
 
@@ -280,6 +282,197 @@ class PlannerTests(unittest.TestCase):
         for value in ["not-json", "[]", "null", "123", "{}"]:
             cache.write_text(value)
             self.assertEqual(plan.check_cache(self.path, date(2026, 10, 3), cache)["status"], "needs_ui")
+
+    def inventory(self):
+        return json.dumps({"total_count": len(self.rows), "rows": self.rows, "folders": self.folders})
+
+    def test_unseen_eligible_recording_never_enters_completed_cache(self):
+        self.add("9월 22일 응용 지형학", folder=4)
+        missing = self.add("sync pending", started="2026-10-06T15:02:00+09:00", visible=False)
+        cache = Path(self.tmp.name) / "cache.json"
+        today = date(2026, 10, 6)
+        result = plan.plan_inventory(self.path, today, self.inventory(), cache, plan.fingerprint(self.path, today))
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(result["reports"][0]["type"], "db_candidate_not_visible")
+        self.assertEqual(result["reports"][0]["z_pk"], missing)
+        self.assertFalse(cache.exists())
+        self.assertEqual(plan.remember(self.path, today, self.inventory(), cache)["status"], "not_saved")
+        self.assertEqual(plan.check_cache(self.path, today, cache)["status"], "needs_ui")
+        # Merely becoming visible must lead to work, even with unchanged DB.
+        self.rows.append({"title": "sync pending", "duration_seconds": 4000})
+        result = plan.plan_inventory(self.path, today, self.inventory(), cache, plan.fingerprint(self.path, today))
+        self.assertEqual([a["z_pk"] for a in result["actions"]], [missing])
+
+    def test_file_plan_preflight_and_saved_identity_verification(self):
+        self.add()
+        today = date(2026, 10, 6)
+        result = {**self.run_plan(), "snapshot_fingerprint": plan.fingerprint(self.path, today)}
+        self.assertEqual(plan.verify_plan(self.path, today, result, before=True)["status"], "ok")
+        self.assertEqual(plan.verify_plan(self.path, today, result)["status"], "failed")
+        action = result["actions"][0]
+        self.db.execute("UPDATE ZCLOUDRECORDING SET ZCUSTOMLABELFORSORTING=?,ZFOLDER=? WHERE Z_PK=?",
+                        (action["desired_title"], action["desired_folder_pk"], action["z_pk"]))
+        self.db.commit()
+        self.assertEqual(plan.verify_plan(self.path, today, result)["status"], "ok")
+        self.assertEqual(plan.verify_plan(self.path, today, result, before=True)["reason"], "database_changed_before_apply")
+
+    def test_playback_and_bookkeeping_changes_keep_verified_cache(self):
+        self.add("9월 22일 응용 지형학", folder=4)
+        for table, columns in plan.IGNORED_CACHE_FIELDS.items():
+            for column in columns:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} REAL")
+        self.db.commit()
+        cache = Path(self.tmp.name) / "cache.json"
+        today = date(2026, 10, 3)
+        self.assertEqual(plan.remember(self.path, today, self.inventory(), cache)["status"], "ok")
+        for table, columns in plan.IGNORED_CACHE_FIELDS.items():
+            for column in columns:
+                with self.subTest(table=table, column=column):
+                    self.db.execute(f"UPDATE {table} SET {column}=123")
+                    self.db.commit()
+                    self.assertEqual(plan.check_cache(self.path, today, cache)["status"], "no_changes")
+
+    def test_deletion_flags_and_unknown_fields_still_invalidate(self):
+        self.add("9월 22일 응용 지형학", folder=4)
+        for column in ("ZFLAGS", "ZSHAREDFLAGS", "ZNEWSTATE"):
+            self.db.execute(f"ALTER TABLE ZCLOUDRECORDING ADD COLUMN {column} INTEGER DEFAULT 0")
+        self.db.commit()
+        cache = Path(self.tmp.name) / "cache.json"
+        today = date(2026, 10, 3)
+        for column in ("ZFLAGS", "ZSHAREDFLAGS", "ZNEWSTATE"):
+            plan.remember(self.path, today, self.inventory(), cache)
+            self.db.execute(f"UPDATE ZCLOUDRECORDING SET {column}=1")
+            self.db.commit()
+            self.assertEqual(plan.check_cache(self.path, today, cache)["status"], "needs_ui")
+
+    def test_new_daily_and_late_synced_recordings_are_not_skipped(self):
+        self.add("9월 22일 응용 지형학", folder=4)
+        cache = Path(self.tmp.name) / "cache.json"
+        today = date(2026, 10, 6)
+        plan.remember(self.path, today, self.inventory(), cache)
+        self.add("새로운 녹음", started="2026-10-06T15:02:00+09:00")
+        self.add("늦게 동기화된 녹음", started="2026-10-05T09:02:00+09:00", duration=4200)
+        checked = plan.check_cache(self.path, today, cache)
+        self.assertEqual(checked["status"], "needs_ui")
+        result = plan.plan_inventory(self.path, today, self.inventory(), cache, checked["snapshot_fingerprint"])
+        self.assertEqual({a["desired_title"] for a in result["actions"]},
+                         {"10월 6일 응용 지형학", "10월 5일 미주지역지리"})
+        self.assertNotIn("cache_saved", result)
+        self.assertEqual(plan.check_cache(self.path, today, cache)["status"], "needs_ui")
+        for action in result["actions"]:
+            self.db.execute("UPDATE ZCLOUDRECORDING SET ZCUSTOMLABELFORSORTING=?,ZFOLDER=? WHERE Z_PK=?",
+                            (action["desired_title"], action["desired_folder_pk"], action["z_pk"]))
+            self.rows[action["z_pk"]-1]["title"] = action["desired_title"]
+        self.db.commit()
+        checked = plan.check_cache(self.path, today, cache)
+        result = plan.plan_inventory(self.path, today, self.inventory(), cache, checked["snapshot_fingerprint"])
+        self.assertEqual(result["actions"], [])
+        self.assertTrue(result["cache_saved"])
+        self.assertEqual(plan.check_cache(self.path, today, cache)["status"], "no_changes")
+
+    def test_next_day_without_new_recordings_keeps_cache(self):
+        self.add("9월 22일 응용 지형학", folder=4)
+        cache = Path(self.tmp.name) / "cache.json"
+        plan.remember(self.path, date(2026, 10, 5), self.inventory(), cache)
+        self.assertEqual(plan.check_cache(self.path, date(2026, 10, 6), cache)["status"], "no_changes")
+
+    def test_change_during_collection_stops_plan_and_cache(self):
+        self.add("9월 22일 응용 지형학", folder=4)
+        cache = Path(self.tmp.name) / "cache.json"
+        today = date(2026, 10, 6)
+        checked = plan.check_cache(self.path, today, cache)
+        collected = self.inventory()
+        self.add(started="2026-10-06T15:02:00+09:00")
+        result = plan.plan_inventory(self.path, today, collected, cache, checked["snapshot_fingerprint"])
+        self.assertEqual(result["status"], "fatal")
+        self.assertEqual(result["actions"], [])
+        self.assertFalse(cache.exists())
+
+    def test_change_during_verification_stops_plan_and_cache(self):
+        self.add("9월 22일 응용 지형학", folder=4)
+        cache = Path(self.tmp.name) / "cache.json"
+        today = date(2026, 10, 6)
+        token = plan.fingerprint(self.path, today)
+        original = plan.build_plan
+        def interrupted(*args):
+            result = original(*args)
+            self.db.execute("UPDATE ZCLOUDRECORDING SET ZFOLDER=1")
+            self.db.commit()
+            return result
+        with patch.object(plan, "build_plan", side_effect=interrupted):
+            result = plan.plan_inventory(self.path, today, self.inventory(), cache, token)
+        self.assertEqual(result["status"], "fatal")
+        self.assertEqual(result["actions"], [])
+        self.assertFalse(cache.exists())
+
+    def test_cache_save_failure_preserves_verified_noop(self):
+        self.add("9월 22일 응용 지형학", folder=4)
+        cache = Path(self.tmp.name) / "cache.json"
+        today = date(2026, 10, 6)
+        with patch.object(plan, "save_snapshot", side_effect=OSError("read-only cache directory")):
+            result = plan.plan_inventory(self.path, today, self.inventory(), cache, plan.fingerprint(self.path, today))
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["actions"], [])
+        self.assertFalse(result["cache_saved"])
+        self.assertFalse(cache.exists())
+
+    def test_bad_inventory_cannot_save_cache_in_one_pass(self):
+        self.add("9월 22일 응용 지형학", folder=4)
+        cache = Path(self.tmp.name) / "cache.json"
+        today = date(2026, 10, 6)
+        token = plan.fingerprint(self.path, today)
+        for payload in [
+            {"total_count": 2, "folders": self.folders, "rows": self.rows},
+            {"total_count": 1, "folders": [], "rows": self.rows},
+        ]:
+            result = plan.plan_inventory(self.path, today, json.dumps(payload), cache, token)
+            self.assertFalse(result.get("cache_saved", False))
+            self.assertFalse(cache.exists())
+
+
+    def test_inventory_file_cli_requires_token_and_saves_verified_noop(self):
+        self.add("9월 22일 응용 지형학", folder=4)
+        cache = Path(self.tmp.name) / "cache.json"
+        inventory = Path(self.tmp.name) / "inventory.json"
+        inventory.write_text(self.inventory())
+        command = [sys.executable, "-B", str(Path(plan.__file__)), "--voice-db", str(self.path),
+                   "--cache", str(cache), "--today", "2026-10-06"]
+        checked = subprocess.run(command + ["--check"], capture_output=True, text=True, check=True)
+        token = json.loads(checked.stdout)["snapshot_fingerprint"]
+        rejected = subprocess.run(command + ["--inventory-file", str(inventory)], capture_output=True, text=True)
+        self.assertEqual(rejected.returncode, 2)
+        self.assertFalse(cache.exists())
+        accepted = subprocess.run(command + ["--inventory-file", str(inventory), "--expected-fingerprint", token],
+                                  capture_output=True, text=True, check=True)
+        self.assertTrue(json.loads(accepted.stdout)["cache_saved"])
+        checked = subprocess.run(command + ["--check"], capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(checked.stdout)["status"], "no_changes")
+
+    def test_plan_file_cli_passes_actions_without_reprinting_and_verifies_saved_changes(self):
+        self.add()
+        directory = Path(self.tmp.name)
+        cache, inventory, actions = [directory / name for name in ("cache.json", "inventory.json", "actions.json")]
+        inventory.write_text(self.inventory())
+        command = [sys.executable, "-B", str(Path(plan.__file__)), "--voice-db", str(self.path),
+                   "--cache", str(cache), "--today", "2026-10-06"]
+        checked = subprocess.run(command + ["--check"], capture_output=True, text=True, check=True)
+        token = json.loads(checked.stdout)["snapshot_fingerprint"]
+        result = subprocess.run(command + ["--inventory-file", str(inventory), "--plan-file", str(actions),
+                                 "--expected-fingerprint", token], capture_output=True, text=True, check=True)
+        self.assertNotIn("actions", json.loads(result.stdout))
+        self.assertEqual(actions.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(cache.exists())
+        subprocess.run(command + ["--validate-plan-file", str(actions)], capture_output=True, check=True)
+        failed = subprocess.run(command + ["--verify-plan-file", str(actions)], capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        action = json.loads(actions.read_text())["actions"][0]
+        self.db.execute("UPDATE ZCLOUDRECORDING SET ZCUSTOMLABELFORSORTING=?,ZFOLDER=? WHERE Z_PK=?",
+                        (action["desired_title"], action["desired_folder_pk"], action["z_pk"]))
+        self.db.commit()
+        result = subprocess.run(command + ["--verify-plan-file", str(actions)], capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), {"status": "ok", "checked": 1, "failed_ids": []})
+        stale = subprocess.run(command + ["--validate-plan-file", str(actions)], capture_output=True)
+        self.assertEqual(stale.returncode, 2)
 
 
 if __name__ == "__main__":

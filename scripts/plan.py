@@ -266,6 +266,13 @@ def build_plan(voice_db: Path, today: date, visible_raw: str) -> dict:
     if reports:
         return {"status": "fatal", "reason": "voice_memos_identity_mismatch", "actions": [], "reports": reports}
 
+    # The UI excludes deleted rows and may temporarily omit a live sync item.
+    # Do not guess which one it is: visible work can proceed, but an unseen
+    # eligible DB row must never be included in a completed snapshot.
+    verified_ids = {row["z_pk"] for row in verified}
+    reports.extend({"type": "db_candidate_not_visible", **serialize_row(row)}
+                   for row in voice_rows if row["z_pk"] not in verified_ids)
+
     timetable_rows = []
     for row in verified:
         if row["course"] is None:
@@ -336,34 +343,96 @@ def verify(voice_db: Path, raw: str) -> dict:
     return {"status": "ok" if not failures else "failed", "checked": len(expected), "failed_ids": failures}
 
 
+# These fields affect playback preferences or Core Data bookkeeping only.
+# Keep deletion flags and unknown fields: an undocumented state change must
+# still invalidate the cache rather than hide a new/restored/deleted recording.
+IGNORED_CACHE_FIELDS = {
+    "ZCLOUDRECORDING": {"Z_OPT", "ZPLAYBACKPOSITION", "ZPLAYBACKRATE", "ZPLAYBACKSPEED",
+                        "ZSTUDIOMIXENABLED", "ZSTUDIOMIXLEVEL",
+                        "ZSILENCEREMOVERENABLED", "ZSKIPSILENCEENABLED"},
+    "ZFOLDER": {"Z_OPT", "ZRANK"},
+}
+
+
 def fingerprint(voice_db: Path, today: date) -> str:
-    # Include every persisted recording/folder field, including deletion flags.
-    # Do not interpret undocumented flags or store private row contents in the cache.
     with ro_connect(voice_db) as db:
         db.execute("BEGIN")
         state = {
-            table: [dict(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY Z_PK")]
+            table: [{key: row[key] for key in row.keys() if key not in IGNORED_CACHE_FIELDS[table]}
+                    for row in db.execute(f"SELECT * FROM {table} ORDER BY Z_PK")]
             for table in ("ZCLOUDRECORDING", "ZFOLDER")
         }
     eligible, _ = voice_candidates(state["ZCLOUDRECORDING"], today)
     state["eligible_ids"] = [row["z_pk"] for row in eligible]
     state["database"] = str(voice_db.resolve())
     state["policy"] = [START_DATE.isoformat(), END_DATE.isoformat(), SCHEDULE]
-    state["code"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    state["code"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                     for name in ("plan.py", "collect.mjs", "apply.mjs")}
     encoded = json.dumps(state, ensure_ascii=False, default=lambda value: value.hex()).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
 def check_cache(voice_db: Path, today: date, cache: Path) -> dict:
+    current = fingerprint(voice_db, today)
+    # The caller passes this token with the collected UI inventory. It proves
+    # the logical DB state stayed unchanged across the entire UI collection.
+    needs_ui = {"status": "needs_ui", "snapshot_fingerprint": current}
     try:
         saved = json.loads(cache.read_text())
     except (OSError, ValueError):
-        return {"status": "needs_ui", "reason": "no_verified_snapshot"}
+        return {**needs_ui, "reason": "no_verified_snapshot"}
     if not isinstance(saved, dict):
-        return {"status": "needs_ui", "reason": "invalid_verified_snapshot"}
-    if saved.get("fingerprint") != fingerprint(voice_db, today):
-        return {"status": "needs_ui", "reason": "recordings_folders_or_rules_changed"}
+        return {**needs_ui, "reason": "invalid_verified_snapshot"}
+    if saved.get("fingerprint") != current:
+        return {**needs_ui, "reason": "recordings_folders_or_rules_changed"}
     return {"status": "no_changes", "basis": "unchanged_ui_verified_snapshot", "actions": []}
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic replacement: interruption cannot leave a partial success record.
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+        temp_path = handle.name
+    try:
+        os.replace(temp_path, path)
+    finally:
+        Path(temp_path).unlink(missing_ok=True)
+
+
+def save_snapshot(cache: Path, value: str) -> None:
+    write_json(cache, {"fingerprint": value})
+
+
+def verify_plan(voice_db: Path, today: date, payload: dict, before: bool = False) -> dict:
+    if payload["status"] != "ok":
+        return {"status": "failed", "reason": "invalid_plan"}
+    if before and payload["snapshot_fingerprint"] != fingerprint(voice_db, today):
+        return {"status": "failed", "reason": "database_changed_before_apply"}
+    expected = [{"z_pk": action["z_pk"], "unique_id": action["unique_id"],
+                 "title": action["current_title"] if before else action["desired_title"],
+                 "folder_pk": action["folder_pk"] if before else action["desired_folder_pk"],
+                 "duration_seconds": action["duration_seconds"]}
+                for action in payload["actions"]]
+    return verify(voice_db, json.dumps(expected))
+
+
+def plan_inventory(voice_db: Path, today: date, raw: str, cache: Path, expected: str) -> dict:
+    before = fingerprint(voice_db, today)
+    if before != expected:
+        return {"status": "fatal", "reason": "database_changed_during_collection", "actions": []}
+    result = build_plan(voice_db, today, raw)
+    if fingerprint(voice_db, today) != before:
+        return {"status": "fatal", "reason": "database_changed_during_verification", "actions": []}
+    if result["status"] == "ok" and not result["actions"] and not result["reports"]:
+        try:
+            save_snapshot(cache, before)
+            result["cache_saved"] = True
+        except OSError as error:
+            # A cache-write failure does not invalidate the verified no-op.
+            result["cache_saved"] = False
+            result["cache_error"] = str(error)
+    return result
 
 
 def remember(voice_db: Path, today: date, raw: str, cache: Path) -> dict:
@@ -375,18 +444,18 @@ def remember(voice_db: Path, today: date, raw: str, cache: Path) -> dict:
         return {"status": "not_saved", "reason": "not_fully_verified_complete"}
     if fingerprint(voice_db, today) != before:
         return {"status": "not_saved", "reason": "database_changed_during_verification"}
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic replacement: interruption cannot leave a partial success record.
-    with tempfile.NamedTemporaryFile(mode="w", dir=cache.parent, delete=False) as handle:
-        json.dump({"fingerprint": before}, handle)
-        temp_path = handle.name
-    os.replace(temp_path, cache)
+    save_snapshot(cache, before)
     return {"status": "ok", "verified_candidates": result["verified_candidates"]}
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--inventory-file", type=Path, help="Collected UI file; plan and cache a verified no-op in one call")
+    parser.add_argument("--plan-file", type=Path, help="Write the inventory plan to this private file; print only counts/reports")
+    mode.add_argument("--validate-plan-file", type=Path, help="Validate unchanged DB snapshot and identities before UI edits")
+    mode.add_argument("--verify-plan-file", type=Path, help="Verify saved titles, folders, durations and identities after UI edits")
+    parser.add_argument("--expected-fingerprint", help="snapshot_fingerprint from --check, before UI collection")
     mode.add_argument("--visible-json", help="Complete UI rows, total_count and folder names; - for stdin")
     mode.add_argument("--verify-json", help="Expected z_pk, unique_id, title, folder_pk, duration_seconds; - for stdin")
     mode.add_argument("--check", action="store_true", help="Skip UI only when the last fully verified DB snapshot is unchanged")
@@ -395,9 +464,24 @@ def main() -> None:
     parser.add_argument("--cache", type=Path, default=CACHE)
     parser.add_argument("--today", type=date.fromisoformat, default=datetime.now(SEOUL).date())
     args = parser.parse_args()
+    if args.inventory_file is not None and not args.expected_fingerprint:
+        parser.error("--inventory-file requires --expected-fingerprint from --check")
+    if args.plan_file is not None and args.inventory_file is None:
+        parser.error("--plan-file requires --inventory-file")
     try:
         if args.check:
             result = check_cache(args.voice_db, args.today, args.cache)
+        elif args.inventory_file is not None:
+            result = plan_inventory(args.voice_db, args.today, args.inventory_file.read_text(),
+                                    args.cache, args.expected_fingerprint)
+            if args.plan_file is not None:
+                write_json(args.plan_file, {**result, "snapshot_fingerprint": args.expected_fingerprint})
+                result = {key: value for key, value in result.items() if key != "actions"}
+                result["plan_file"] = str(args.plan_file.resolve())
+        elif args.validate_plan_file is not None or args.verify_plan_file is not None:
+            path = args.validate_plan_file or args.verify_plan_file
+            result = verify_plan(args.voice_db, args.today, json.loads(path.read_text()),
+                                 before=args.validate_plan_file is not None)
         elif args.remember_json is not None:
             result = remember(args.voice_db, args.today, args.remember_json, args.cache)
         elif args.verify_json is not None:
