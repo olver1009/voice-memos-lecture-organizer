@@ -1,6 +1,6 @@
 // Runs the planner's exact title/folder actions through cua, never the database.
 // Carry the skill's snapshot token into the dependency URL as well.
-const {elements, requireOne, assertReady, allRecordings, recordingElements} =
+const {elements, requireOne, observeMain, allRecordings, recordingElements} =
   await import(new URL('./collect.mjs', import.meta.url).href + new URL(import.meta.url).search);
 
 const normalized = value => value.normalize('NFC').trim().replace(/\s+/g, ' ');
@@ -44,13 +44,13 @@ function folderButton(ax, name) {
 
 export async function applyActions(app, plan) {
   const completed = [];
-  let current;
+  let current, stage = 'initial';
+  const attempted = [];
   try {
     if (plan.status !== 'ok' || !Array.isArray(plan.actions)) throw new Error('Invalid planner result');
-    const observe = async () => {
-      const ax = await app.getAXState({disableDiffing: true, emit: false});
-      assertReady(ax);
-      return ax;
+    const observe = async (label = stage, predicate) => {
+      stage = label;
+      return observeMain(app, label, predicate);
     };
     const revealSelected = async (ax, action) => {
       if (selectedRows(ax, action).length) return ax;
@@ -87,13 +87,16 @@ export async function applyActions(app, plan) {
           (!action.rename_to && !action.move_to) ||
           (action.rename_to && action.rename_to !== action.desired_title) ||
           (action.move_to && action.move_to !== action.course)) throw new Error('Invalid recording action');
+      stage = 'select recording';
+      const progress = {z_pk: current, rename_attempted: false, move_attempted: false};
+      attempted.push(progress);
       let ax = await observe();
       if (!allRecordings(ax).text.includes('(selected)')) throw new Error('All Recordings must be selected');
       await app.setValue(searchField(ax).index, action.current_title);
-      ax = await observe();
+      ax = await observe('search recording', state => Boolean(exactRow(state, action.current_title, action.duration_seconds)));
       let row = exactRow(ax, action.current_title, action.duration_seconds);
       await app.click(row.index);
-      ax = await observe();
+      ax = await observe('confirm recording selection', state => exactRow(state, action.current_title, action.duration_seconds).selected);
       row = exactRow(ax, action.current_title, action.duration_seconds);
       if (!row.selected) {
         throw new Error('Selected recording does not match the plan');
@@ -109,9 +112,11 @@ export async function applyActions(app, plan) {
         ax = await observe();
         ax = await revealSelected(ax, action);
         selectedRow(ax, action);
+        stage = 'save title';
+        progress.rename_attempted = true;
         await app.setValue(assertTitle(ax, action.current_title).index, action.rename_to);
         await app.pressKey('Return');
-        ax = await observe();
+        ax = await observe('verify saved title', state => Boolean(assertTitle(state, action.desired_title)));
         assertTitle(ax, action.desired_title);
         // Voice Memos may retain the old AX row label until the list is
         // rebuilt. The selected title field must already show the saved value.
@@ -120,20 +125,27 @@ export async function applyActions(app, plan) {
       if (action.move_to) {
         if (!row.actions.includes('이동')) throw new Error('Move action unavailable');
         await app.performSecondaryAction(row.index, '이동');
-        const sheet = await app.getAXState({disableDiffing: true, emit: false});
-        if (!sheet.includes('시트') || !sheet.includes('ID: FoldersList') || !sheet.includes('폴더 선택')) {
-          throw new Error('Unexpected folder-selection sheet');
+        stage = 'open folder selection';
+        let sheet;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          sheet = await app.getAXState({disableDiffing: true, emit: false});
+          if (sheet.includes('시트') && sheet.includes('ID: FoldersList') && sheet.includes('폴더 선택')) break;
         }
+        if (!sheet.includes('시트') || !sheet.includes('ID: FoldersList') || !sheet.includes('폴더 선택')) {
+          throw new Error('Folder-selection sheet did not appear');
+        }
+        stage = 'save folder move';
+        progress.move_attempted = true;
         await app.click(folderButton(sheet, action.move_to).index);
-        ax = await observe();
+        ax = await observe('after folder move', state => !state.includes('시트'));
       }
       if (action.rename_to || action.move_to) {
         await app.click(folderButton(ax, action.course).index);
-        ax = await observe();
+        ax = await observe('verify destination folder', state => folderButton(state, action.course).text.includes('(selected)'));
         const folder = folderButton(ax, action.course);
         if (!folder.text.includes('(selected)')) throw new Error('Destination folder was not selected');
         await app.setValue(searchField(ax).index, action.desired_title);
-        ax = await observe();
+        ax = await observe('verify saved recording in folder', state => Boolean(exactRow(state, action.desired_title, action.duration_seconds)));
         exactRow(ax, action.desired_title, action.duration_seconds);
         await app.click(allRecordings(ax).index);
         ax = await observe();
@@ -146,6 +158,7 @@ export async function applyActions(app, plan) {
     return {status: 'ok', ui_completed: completed};
   } catch (error) {
     // Never continue to the next recording or retry a possibly saved change.
-    return {status: 'failed', ui_completed: completed, failed_z_pk: current, error: error.message};
+    return {status: 'failed', ui_completed: completed, attempted, failed_z_pk: current,
+      stage: error.stage ?? stage, error: error.message, ...(error.axExcerpt ? {ax_excerpt: error.axExcerpt} : {})};
   }
 }

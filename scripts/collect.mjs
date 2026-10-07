@@ -26,6 +26,27 @@ export function assertReady(ax) {
   }
 }
 
+// App transitions can expose only the dismissing sheet for one observation.
+// Retry observations, never clicks or edits; a persistent missing view fails.
+export async function observeMain(app, stage = 'main window', predicate = () => true) {
+  let last = '';
+  for (let attempt = 0; attempt < 5; attempt++) {
+    last = await app.getAXState({disableDiffing: true, emit: false});
+    if (!last.includes('ID: SceneWindow') || !last.includes('ID: Main Window')) continue;
+    assertReady(last);
+    try {
+      if (predicate(last)) return last;
+    } catch {
+      // A transition can momentarily omit the expected list or sidebar.
+      // Observe again, without repeating the operation.
+    }
+  }
+  const error = new Error(`Voice Memos view did not settle: ${stage}`);
+  error.stage = stage;
+  error.axExcerpt = last.slice(0, 4000);
+  throw error;
+}
+
 export function allRecordings(ax) {
   return requireOne(elements(ax).filter(e =>
     /^(?:버튼|button)(?: \(selected\))? Description: 모든 녹음 항목, \d+개의 녹음 항목,/.test(e.text)
@@ -66,9 +87,7 @@ export function recordingRows(ax) {
 
 export async function collectInventory(app) {
   const observe = async () => {
-    const ax = await app.getAXState({disableDiffing: true, emit: false});
-    assertReady(ax);
-    return ax;
+    return observeMain(app, 'inventory');
   };
   let ax = await observe();
   if (!elements(ax).some(e => e.text.includes('Description: 모든 녹음 항목,'))) {

@@ -25,7 +25,7 @@ START_DATE = date(2026, 9, 1)
 END_DATE = date(2026, 12, 18)
 
 VOICE_DB = Path.home() / "Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/CloudRecordings.db"
-CACHE = Path.home() / "Documents/Codex/.cache/lecture-recording-organizer.json"
+CACHE = Path(tempfile.gettempdir()) / f"lecture-recording-organizer-{os.getuid()}" / "state.json"
 
 SCHEDULE = {
     0: [("09:00", "10:30", "미주지역지리"), ("13:00", "15:00", "지도학및실습"), ("16:30", "18:00", "도시지리학특강")],
@@ -91,20 +91,25 @@ def parse_hhmm(value: str) -> time:
     return datetime.strptime(value, "%H:%M").time()
 
 
-def classify(started: datetime) -> str | None:
-    classes = SCHEDULE.get(started.weekday(), [])
-    current = started.time().replace(tzinfo=None)
-    core = [course for start, end, course in classes if parse_hhmm(start) <= current < parse_hhmm(end)]
-    if len(core) == 1:
-        return core[0]
-    if core:
+def classify(started: datetime, duration_seconds: float | None = None) -> str | None:
+    candidates = []
+    for start, end, course in SCHEDULE.get(started.weekday(), []):
+        begins = datetime.combine(started.date(), parse_hhmm(start), SEOUL)
+        ends = datetime.combine(started.date(), parse_hhmm(end), SEOUL)
+        if begins - timedelta(minutes=15) <= started < ends:
+            candidates.append((begins, ends, course))
+    if len(candidates) == 1:
+        return candidates[0][2]
+    if not candidates or duration_seconds is None or duration_seconds <= 0:
         return None
-    early = []
-    for start, _end, course in classes:
-        class_start = datetime.combine(started.date(), parse_hhmm(start), SEOUL)
-        if class_start - timedelta(minutes=15) <= started < class_start:
-            early.append(course)
-    return early[0] if len(early) == 1 else None
+    # Adjacent classes overlap only in the early-start allowance. Compare
+    # actual recording time inside each class; a tie needs human resolution.
+    finished = started + timedelta(seconds=duration_seconds)
+    overlaps = [(max(0, (min(finished, end) - max(started, begin)).total_seconds()), course)
+                for begin, end, course in candidates]
+    longest = max(overlap for overlap, _course in overlaps)
+    matches = [course for overlap, course in overlaps if overlap == longest and overlap > 0]
+    return matches[0] if len(matches) == 1 else None
 
 
 def load_voice_rows(path: Path, today: date) -> tuple[list[dict], Counter[tuple[str, int]]]:
@@ -146,7 +151,7 @@ def voice_candidates(rows: list, today: date) -> tuple[list[dict], Counter[tuple
                 "current_title": title,
                 "started": started,
                 "seconds": seconds,
-                "course": classify(started),
+                "course": classify(started, float(row["ZDURATION"] or 0)),
             }
         )
     return result, ignored
@@ -198,8 +203,11 @@ def existing_title_slot(current: str, base: str, count: int) -> int | None:
     return position if total == count and 1 <= position <= count else None
 
 
-def assign_titles(group: list[dict]) -> None:
+def assign_titles(group: list[dict], preserve_single_part: bool = True) -> None:
     count = len(group)
+    if count == 1 and not preserve_single_part and re.search(r"\d+-\d+$", canonical_title(group[0]["current_title"])):
+        group[0]["desired_title"] = base_title(group[0])
+        return
     used: set[int] = set()
     for row in group:
         base = base_title(row)
@@ -285,7 +293,7 @@ def build_plan(voice_db: Path, today: date, visible_raw: str) -> dict:
         grouped[(row["started"].date(), row["course"])].append(row)
     for group in grouped.values():
         group.sort(key=lambda row: row["started"])
-        assign_titles(group)
+        assign_titles(group, preserve_single_part=group[0]["started"].date() < today)
 
     folders = load_folders(voice_db)
     payload = json.loads(visible_raw)
@@ -389,7 +397,7 @@ def check_cache(voice_db: Path, today: date, cache: Path) -> dict:
 
 
 def write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Atomic replacement: interruption cannot leave a partial success record.
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
         json.dump(payload, handle, ensure_ascii=False)
