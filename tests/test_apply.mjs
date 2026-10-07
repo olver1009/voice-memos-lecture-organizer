@@ -126,3 +126,47 @@ test('no-op and fatal plans never touch the app', async () => {
   assert.equal((await applyActions(app, {status:'ok', actions:[]})).status, 'ok');
   assert.equal((await applyActions(app, {status:'fatal', actions:[action()]})).status, 'failed');
 });
+
+
+test('a transient dismissed sheet is observed without repeating the saved move', async () => {
+  const actions = [action(1), action(2)]; const app = new FakeApp(actions);
+  const click = app.click.bind(app), observe = app.getAXState.bind(app);
+  let transient = 0;
+  app.click = async index => {const moving = app.sheet; await click(index); if (moving) transient = 2;};
+  app.getAXState = async options => transient-- > 0
+    ? '0 シート 폴더 선택, ID: FoldersList' : observe(options);
+  const result = await applyActions(app, {status:'ok', actions});
+  assert.equal(result.status, 'ok'); assert.equal(result.ui_completed.length, 2);
+  assert.equal(app.mutations.filter(m => m[0] === 'move').length, 2);
+});
+
+test('a permanent missing window after a saved move stops with attempted work and stage', async () => {
+  const actions = [action(1), action(2)]; const app = new FakeApp(actions);
+  const click = app.click.bind(app), observe = app.getAXState.bind(app);
+  let unavailable = false, observations = 0;
+  app.click = async index => {const moving = app.sheet; await click(index); if (moving) unavailable = true;};
+  app.getAXState = async options => {
+    if (unavailable) {observations++; return 'Screen locked';}
+    return observe(options);
+  };
+  const result = await applyActions(app, {status:'ok', actions});
+  assert.equal(result.status, 'failed'); assert.equal(observations, 5);
+  assert.equal(result.stage, 'after folder move');
+  assert.deepEqual(result.attempted, [{z_pk:1, rename_attempted:true, move_attempted:true}]);
+  assert.equal(app.rows[0].title, actions[0].desired_title);
+  assert.equal(app.rows[1].title, actions[1].current_title);
+  assert.equal(app.mutations.filter(m => m[0] === 'move').length, 1);
+});
+
+test('a delayed destination view is observed without repeating the folder click', async () => {
+  const actions = [action(1)]; const app = new FakeApp(actions);
+  const click = app.click.bind(app), observe = app.getAXState.bind(app);
+  let lag = 0;
+  app.click = async index => {const switching = !app.sheet && index === app.base+21; await click(index); if (switching) lag = 1;};
+  app.getAXState = async options => {
+    const state = await observe(options);
+    return lag-- > 0 ? state.replace(/버튼 \(selected\) Description: 응용 지형학/g, '버튼 Description: 응용 지형학') : state;
+  };
+  assert.equal((await applyActions(app, {status:'ok', actions})).status, 'ok');
+  assert.equal(app.mutations.length, 2);
+});

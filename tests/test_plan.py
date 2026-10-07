@@ -175,6 +175,82 @@ class PlannerTests(unittest.TestCase):
         self.add(started="2026-09-25T15:00:00+09:00")
         self.assertEqual(self.run_plan()["reports"][0]["type"], "timetable_mismatch")
 
+    def test_adjacent_classes_use_recording_overlap_not_only_start(self):
+        cases = [
+            ("2026-10-07T14:59:21+09:00", 4602, "도시지리학특강"),
+            ("2026-10-07T14:45:00+09:00", 1000, "지도학및실습"),
+            ("2026-10-07T14:45:00+09:00", 4500, "도시지리학특강"),
+            ("2026-10-06T16:29:00+09:00", 4000, "기후변화와 미래환경"),
+            ("2026-10-08T16:20:00+09:00", 601, "응용 지형학"),
+            ("2026-10-07T14:45:00+09:00", 1800, None),
+            ("2026-10-07T14:59:21+09:00", None, None),
+        ]
+        for started, seconds, expected in cases:
+            with self.subTest(started=started, seconds=seconds):
+                self.assertEqual(plan.classify(datetime.fromisoformat(started), seconds), expected)
+
+    def test_real_oct7_misclassification_is_repaired_without_false_fragments(self):
+        self.add("10월 7일 미주지역지리", started="2026-10-07T10:31:12+09:00", duration=4497, folder=1)
+        map_pk = self.add("10월 7일 지도학및실습 1-2", started="2026-10-07T13:00:57+09:00", duration=5378, folder=2)
+        city_pk = self.add("10월 7일 지도학및실습 2-2", started="2026-10-07T14:59:21+09:00", duration=4602, folder=2)
+        result = plan.build_plan(self.path, date(2026, 10, 7), self.inventory())
+        self.assertEqual(result["reports"], [])
+        self.assertEqual([(a["z_pk"], a["desired_title"], a["desired_folder_pk"]) for a in result["actions"]],
+                         [(map_pk, "10월 7일 지도학및실습", 2), (city_pk, "10월 7일 도시지리학특강", 3)])
+        self.assertEqual(result["actions"][0]["move_to"], None)
+        for action in result["actions"]:
+            self.db.execute("UPDATE ZCLOUDRECORDING SET ZCUSTOMLABELFORSORTING=?,ZFOLDER=? WHERE Z_PK=?",
+                            (action["desired_title"], action["desired_folder_pk"], action["z_pk"]))
+            self.rows[action["z_pk"]-1]["title"] = action["desired_title"]
+        self.db.commit()
+        self.assertEqual(plan.build_plan(self.path, date(2026, 10, 7), self.inventory())["actions"], [])
+
+    def test_tomorrow_new_recordings_after_today_cache_are_classified_and_saved(self):
+        self.add("10월 7일 지도학및실습", started="2026-10-07T13:00:57+09:00", duration=5378, folder=2)
+        self.add("10월 7일 도시지리학특강", started="2026-10-07T14:59:21+09:00", duration=4602, folder=3)
+        cache = Path(self.tmp.name) / "cache.json"
+        today, tomorrow = date(2026, 10, 7), date(2026, 10, 8)
+        saved = plan.plan_inventory(self.path, today, self.inventory(), cache, plan.fingerprint(self.path, today))
+        self.assertTrue(saved["cache_saved"])
+        self.add("새로운 녹음", started="2026-10-08T14:59:55+09:00", duration=4400)
+        self.add("새로운 녹음 2", started="2026-10-08T16:29:10+09:00", duration=4300)
+        checked = plan.check_cache(self.path, tomorrow, cache)
+        self.assertEqual(checked["status"], "needs_ui")
+        result = plan.plan_inventory(self.path, tomorrow, self.inventory(), cache, checked["snapshot_fingerprint"])
+        self.assertEqual(result["reports"], [])
+        self.assertEqual([a["desired_title"] for a in result["actions"]],
+                         ["10월 8일 응용 지형학", "10월 8일 기후변화와 미래환경"])
+        for action in result["actions"]:
+            self.db.execute("UPDATE ZCLOUDRECORDING SET ZCUSTOMLABELFORSORTING=?,ZFOLDER=? WHERE Z_PK=?",
+                            (action["desired_title"], action["desired_folder_pk"], action["z_pk"]))
+            self.rows[action["z_pk"]-1]["title"] = action["desired_title"]
+        self.db.commit()
+        saved = plan.plan_inventory(self.path, tomorrow, self.inventory(), cache, plan.fingerprint(self.path, tomorrow))
+        self.assertTrue(saved["cache_saved"])
+        self.assertEqual(plan.check_cache(self.path, tomorrow, cache)["status"], "no_changes")
+
+    def test_same_course_real_fragments_still_receive_part_numbers(self):
+        self.add("first", started="2026-10-07T13:00:00+09:00", duration=2000)
+        self.add("second", started="2026-10-07T13:40:00+09:00", duration=1800)
+        result = plan.build_plan(self.path, date(2026, 10, 7), self.inventory())
+        self.assertEqual([a["desired_title"] for a in result["actions"]],
+                         ["10월 7일 지도학및실습 1-2", "10월 7일 지도학및실습 2-2"])
+
+    def test_today_single_standard_title_keeps_its_spacing(self):
+        self.add("10월 8일 응용지형학", started="2026-10-08T15:01:00+09:00", folder=4)
+        self.assertEqual(plan.build_plan(self.path, date(2026, 10, 8), self.inventory())["actions"], [])
+
+    def test_default_cache_is_in_temp_and_independent_of_working_directory(self):
+        import os
+        from tempfile import gettempdir
+        self.assertTrue(plan.CACHE.is_relative_to(Path(gettempdir())))
+        outputs=[]
+        for cwd in (self.tmp.name, str(Path(plan.__file__).parent)):
+            command=[sys.executable, "-B", "-c", "import plan; print(plan.CACHE)"]
+            outputs.append(subprocess.check_output(command, cwd=cwd, text=True,
+                env={**os.environ, "PYTHONPATH":str(Path(plan.__file__).parent)}).strip())
+        self.assertEqual(outputs, [str(plan.CACHE)]*2)
+
     def test_split_titles_are_unique_and_stable(self):
         self.add("first")
         self.add("second", started="2026-09-22T15:20:00+09:00", duration=2000)
